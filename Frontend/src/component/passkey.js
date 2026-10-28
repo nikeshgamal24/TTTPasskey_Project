@@ -27,6 +27,38 @@ function Passkey( { setIsAuthenticated, setUserEmail } ) { //accepting setIsAuth
     return new Uint8Array(binary.split('').map(c => c.charCodeAt(0)));
   };
 
+  // ===== CHANGE 1: new helpers to send the registration credential as proper JSON =====
+  // old code
+  // (none: these helpers did not exist; the raw credential object was posted directly)
+  // new code
+  // ArrayBuffer -> base64url string
+  const bufferToBase64Url = (buffer) => {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  };
+
+  // Registration credential -> JSON format that the server's verifyRegistrationResponse expects
+  const registrationCredentialToJSON = (credential) => {
+    if (typeof credential.toJSON === 'function') {
+      return credential.toJSON(); // modern Chrome has this built in
+    }
+    return {                      // fallback for browsers without toJSON()
+      id: credential.id,
+      rawId: bufferToBase64Url(credential.rawId),
+      type: credential.type,
+      authenticatorAttachment: credential.authenticatorAttachment,
+      clientExtensionResults: credential.getClientExtensionResults(),
+      response: {
+        clientDataJSON: bufferToBase64Url(credential.response.clientDataJSON),
+        attestationObject: bufferToBase64Url(credential.response.attestationObject),
+        transports: credential.response.getTransports ? credential.response.getTransports() : [],
+      },
+    };
+  };
+  // ===== END CHANGE 1 =====
+
   const handleRegister = async () => {
     if (!email) {
       setError('Please enter your email');
@@ -45,6 +77,21 @@ function Passkey( { setIsAuthenticated, setUserEmail } ) { //accepting setIsAuth
         { email },
       );
 
+      // ===== CHANGE 2: pass the server's hints and timeout to the browser (they were being dropped) =====
+      // old code
+      // const publicKeyCredentialCreationOptionsParsed = {
+      //   challenge: base64UrlToUint8Array(publicKeyCredentialCreationOptions.challenge),
+      //   rp: publicKeyCredentialCreationOptions.rp,
+      //   user: {
+      //     id: base64UrlToUint8Array(publicKeyCredentialCreationOptions.user.id),
+      //     name: publicKeyCredentialCreationOptions.user.name,
+      //     displayName: publicKeyCredentialCreationOptions.user.displayName
+      //   },
+      //   pubKeyCredParams: publicKeyCredentialCreationOptions.pubKeyCredParams,
+      //   authenticatorSelection: publicKeyCredentialCreationOptions.authenticatorSelection,
+      //   attestation: publicKeyCredentialCreationOptions.attestation,
+      // };
+      // new code
       const publicKeyCredentialCreationOptionsParsed = {
         challenge: base64UrlToUint8Array(publicKeyCredentialCreationOptions.challenge),
         rp: publicKeyCredentialCreationOptions.rp,
@@ -56,17 +103,28 @@ function Passkey( { setIsAuthenticated, setUserEmail } ) { //accepting setIsAuth
         pubKeyCredParams: publicKeyCredentialCreationOptions.pubKeyCredParams,
         authenticatorSelection: publicKeyCredentialCreationOptions.authenticatorSelection,
         attestation: publicKeyCredentialCreationOptions.attestation,
+        hints: publicKeyCredentialCreationOptions.hints,     // added: ['hybrid'] -> Chrome shows the QR code
+        timeout: publicKeyCredentialCreationOptions.timeout, // added: 3 minutes to scan
       };
+      // ===== END CHANGE 2 =====
 
       const credential = await navigator.credentials.create({
         publicKey: publicKeyCredentialCreationOptionsParsed,
       });
 
+      // ===== CHANGE 3: send the credential as base64url JSON instead of the raw browser object =====
+      // old code
+      // await axios.post(apiUrl('/webauthn/register/complete'), {
+      //   email,
+      //   credential,
+      //   
+      // });
+      // new code
       await axios.post(apiUrl('/webauthn/register/complete'), {
         email,
-        credential,
-        
+        credential: registrationCredentialToJSON(credential),
       });
+      // ===== END CHANGE 3 =====
 
       window.alert('Registration successful');
       setEmail('');
@@ -81,7 +139,12 @@ function Passkey( { setIsAuthenticated, setUserEmail } ) { //accepting setIsAuth
       // More detailed error handling
       if (error.response) {
         // Server responded with error
-        setError('Server error: ' + error.response.data?.error || error.message);
+        // ===== CHANGE 4: parentheses fix; without them the message showed "Server error: undefined" =====
+        // old code
+        // setError('Server error: ' + error.response.data?.error || error.message);
+        // new code
+        setError('Server error: ' + (error.response.data?.error || error.message));
+        // ===== END CHANGE 4 =====
       } else if (error.request) {
         // Request made but no response
         setError(`Network Error: Backend not responding. Check REACT_APP_API_BASE_URL or backend availability at ${apiUrl('') || window.location.origin}`);
@@ -109,15 +172,31 @@ function Passkey( { setIsAuthenticated, setUserEmail } ) { //accepting setIsAuth
         { withCredentials: true }
       );
 
+      // ===== CHANGE 5: use the server's transports/hints instead of hardcoded ['internal'] (= laptop only) =====
+      // old code
+      // const publicKeyCredentialRequestOptionsParsed = {
+      //   challenge: base64UrlToUint8Array(publicKeyCredentialRequestOptions.challenge),
+      //   allowCredentials: [{
+      //     type: 'public-key',
+      //     id: base64UrlToUint8Array(publicKeyCredentialRequestOptions.allowCredentials[0].id),
+      //     transports: ['internal']
+      //   }],
+      //   userVerification: publicKeyCredentialRequestOptions.userVerification
+      // };
+      // new code
       const publicKeyCredentialRequestOptionsParsed = {
         challenge: base64UrlToUint8Array(publicKeyCredentialRequestOptions.challenge),
+        rpId: publicKeyCredentialRequestOptions.rpId,                           // added
         allowCredentials: [{
           type: 'public-key',
           id: base64UrlToUint8Array(publicKeyCredentialRequestOptions.allowCredentials[0].id),
-          transports: ['internal']
+          transports: publicKeyCredentialRequestOptions.allowCredentials[0].transports // was ['internal']
         }],
-        userVerification: publicKeyCredentialRequestOptions.userVerification
+        userVerification: publicKeyCredentialRequestOptions.userVerification,
+        hints: publicKeyCredentialRequestOptions.hints,                         // added: ['hybrid']
+        timeout: publicKeyCredentialRequestOptions.timeout,                     // added
       };
+      // ===== END CHANGE 5 =====
 
       const assertion = await navigator.credentials.get({ 
         publicKey: publicKeyCredentialRequestOptionsParsed 
@@ -162,7 +241,12 @@ function Passkey( { setIsAuthenticated, setUserEmail } ) { //accepting setIsAuth
 
     } catch (error) {
       console.error('Authentication failed:', error);
-      setError('Authentication failed: ' + error.message);
+      // ===== CHANGE 6: show the server's real reason (e.g. origin mismatch) instead of only "status code 401" =====
+      // old code
+      // setError('Authentication failed: ' + error.message);
+      // new code
+      setError('Authentication failed: ' + (error.response?.data?.details || error.response?.data?.error || error.message));
+      // ===== END CHANGE 6 =====
     } finally {
       setIsLoading(false);
     }

@@ -19,9 +19,16 @@ const { verifyRegistrationResponse, verifyAuthenticationResponse } = require('@s
 const port = process.env.PORT || 5200;
 const isProduction = process.env.NODE_ENV === 'production';
 
-// Load JWT keys from environment variables
-const privateKey = process.env.JWT_PRIVATE_KEY.replace(/\\n/g, '\n');
-const publicKey = process.env.JWT_PUBLIC_KEY.replace(/\\n/g, '\n');
+// ===== CHANGE 9: the multi-line key in .env wasn't parsed as a valid key (crash: "secretOrPrivateKey
+//                 must be an asymmetric key"), so load the keys from .pem files in the Backend folder =====
+// old code
+// // Load JWT keys from environment variables
+// const privateKey = process.env.JWT_PRIVATE_KEY.replace(/\\n/g, '\n');
+// const publicKey = process.env.JWT_PUBLIC_KEY.replace(/\\n/g, '\n');
+// new code
+const privateKey = fs.readFileSync(path.join(__dirname, 'private.pem'), 'utf8');
+const publicKey = fs.readFileSync(path.join(__dirname, 'public.pem'), 'utf8');
+// ===== END CHANGE 9 =====
 
 const app = express();
 
@@ -69,7 +76,12 @@ const pendingRegistrations = {}; // Store pending registrations in memory
 const con = mysql.createPool({
     host: process.env.DB_HOST || "localhost",
     user: process.env.DB_USER || "root",
-    password: process.env.DB_PASSWORD || "Hashtag@123",
+    // ===== CHANGE 1: don't hardcode a DB password in the code (it's in .env) =====
+    // old code
+    // password: process.env.DB_PASSWORD || "Hashtag@123",
+    // new code
+    password: process.env.DB_PASSWORD,
+    // ===== END CHANGE 1 =====
     database: process.env.DB_NAME || 'webauthn_passkey',
     ssl: isProduction ? {
         rejectUnauthorized: false  // JawsDB uses self-signed certificates
@@ -118,7 +130,12 @@ const generateRefreshToken = (email, userId) => {
 const authenticateToken = (req, res, next) => {
     const token = req.cookies.accessToken;
 
-    if (!token) return res.sendStatus(401).json({ error: 'Access token missing' });
+    // ===== CHANGE 2: sendStatus() already sends the response, so .json() after it throws =====
+    // old code
+    // if (!token) return res.sendStatus(401).json({ error: 'Access token missing' });
+    // new code
+    if (!token) return res.status(401).json({ error: 'Access token missing' });
+    // ===== END CHANGE 2 =====
 
     try {
         const decoded = jwt.verify(token, publicKey, { algorithms: ['RS256'] });
@@ -131,15 +148,25 @@ const authenticateToken = (req, res, next) => {
 };
 
 // Expected origin for WebAuthn verification
+// (set ORIGIN and RP_ID in .env, e.g. ORIGIN=http://localhost:3000 and RP_ID=localhost)
 const expectedOrigin = process.env.ORIGIN || 
     (isProduction 
         ? process.env.HEROKU_APP_URL || `https://${process.env.HEROKU_APP_NAME}.herokuapp.com`
         : 'http://localhost:5200');
 
-const expectedRPID = process.env.RP_ID || 
-    (isProduction 
-        ? process.env.HEROKU_APP_NAME || 'herokuapp.com'
+// ===== CHANGE 3: RP ID must be the full hostname (myapp.herokuapp.com), not just the app name;
+//                 'herokuapp.com' alone is rejected by browsers (public suffix) =====
+// old code
+// const expectedRPID = process.env.RP_ID || 
+//     (isProduction 
+//         ? process.env.HEROKU_APP_NAME || 'herokuapp.com'
+//         : 'localhost');
+// new code
+const expectedRPID = process.env.RP_ID ||
+    (isProduction
+        ? `${process.env.HEROKU_APP_NAME}.herokuapp.com`
         : 'localhost');
+// ===== END CHANGE 3 =====
 
 // Endpoint to complete registration
 app.post('/webauthn/register', authLimiter, (req, res) => {
@@ -173,7 +200,12 @@ app.post('/webauthn/register', authLimiter, (req, res) => {
         }
 
         // Proceed with registration if the user doesn't exist
-        const userId = crypto.randomBytes(32).toString('base64');
+        // ===== CHANGE 4: base64url (no + / =) so the frontend's base64url decoder handles it =====
+        // old code
+        // const userId = crypto.randomBytes(32).toString('base64');
+        // new code
+        const userId = crypto.randomBytes(32).toString('base64url');
+        // ===== END CHANGE 4 =====
        
         // Generate the challenge as a Buffer first
         const challengeBuffer = crypto.randomBytes(32);
@@ -196,7 +228,31 @@ app.post('/webauthn/register', authLimiter, (req, res) => {
             }
         });
 
-        // Define WebAuthn options for registration
+        // ===== CHANGE 5: create the passkey on the PHONE (hybrid / QR code) instead of this laptop =====
+        // old code
+        // const publicKeyCredentialCreationOptions = {
+        //     challenge: challenge,
+        //     rp: {
+        //         name: 'Passwordless login',
+        //         id: expectedRPID
+        //     },
+        //     user: {
+        //         id: userId,
+        //         name: validatedEmail,
+        //         displayName: validatedEmail,
+        //     },
+        //     pubKeyCredParams: [
+        //         { type: 'public-key', alg: -7 },
+        //         { type: 'public-key', alg: -257 }
+        //     ], // ES256 RS256
+        //     authenticatorSelection: {
+        //         authenticatorAttachment: 'platform',
+        //         residentKey: 'required',
+        //         userVerification: 'required',
+        //     },
+        //     attestation: 'direct',
+        // };
+        // new code
         const publicKeyCredentialCreationOptions = {
             challenge: challenge,
             rp: {
@@ -213,12 +269,15 @@ app.post('/webauthn/register', authLimiter, (req, res) => {
                 { type: 'public-key', alg: -257 }
             ], // ES256 RS256
             authenticatorSelection: {
-                authenticatorAttachment: 'platform',
+                authenticatorAttachment: 'cross-platform', // was 'platform' (= this laptop / Google Password Manager)
                 residentKey: 'required',
-                userVerification: 'required',
+                userVerification: 'required',              // phone asks for fingerprint (or screen-lock PIN)
             },
-            attestation: 'direct',
+            hints: ['hybrid'],    // added: tells Chrome to go straight to "use a phone" / QR code
+            attestation: 'none',  // was 'direct': phone passkey providers return 'none' anyway
+            timeout: 180000,      // added: 3 minutes for QR scan + Bluetooth handshake
         };
+        // ===== END CHANGE 5 =====
 
         // Respond with WebAuthn options
         res.json(publicKeyCredentialCreationOptions);
@@ -377,19 +436,36 @@ app.post('/webauthn/authenticate', authLimiter, (req, res) => {
 
             const credentialId = results[0].credential_id;
 
-            // Send authentication request to frontend
+            // ===== CHANGE 6: log in with the passkey on the PHONE (hybrid / QR code) =====
+            // old code
+            // const publicKeyCredentialRequestOptions = {
+            //     challenge: challenge,  // Use the same challenge format consistently
+            //     allowCredentials: [
+            //         {
+            //             type: 'public-key',
+            //             id: credentialId,
+            //             transports: ['internal'],
+            //         }
+            //     ],
+            //     userVerification: 'required',
+            //     timeout: 60000,
+            // };
+            // new code
             const publicKeyCredentialRequestOptions = {
                 challenge: challenge,  // Use the same challenge format consistently
+                rpId: expectedRPID,    // added: must match the domain the passkey was created for
                 allowCredentials: [
                     {
                         type: 'public-key',
                         id: credentialId,
-                        transports: ['internal'],
+                        transports: ['hybrid', 'internal'], // was ['internal'] (= "this laptop only")
                     }
                 ],
+                hints: ['hybrid'],     // added: go straight to "use a phone" / QR code
                 userVerification: 'required',
-                timeout: 60000,
+                timeout: 180000,       // was 60000: QR scan + Bluetooth needs more time
             };
+            // ===== END CHANGE 6 =====
             
             res.json(publicKeyCredentialRequestOptions);
         });
@@ -404,7 +480,12 @@ app.post('/webauthn/authenticate/complete', (req, res) => {
     }
 
     // Get the user data needed for verification
-    const getUserDataQuery = `SELECT challenge, public_key, credential_id, counter FROM users WHERE email = ?`;
+    // ===== CHANGE 7: also select user_id; it's used for the JWT below and was always undefined =====
+    // old code
+    // const getUserDataQuery = `SELECT challenge, public_key, credential_id, counter FROM users WHERE email = ?`;
+    // new code
+    const getUserDataQuery = `SELECT user_id, challenge, public_key, credential_id, counter FROM users WHERE email = ?`;
+    // ===== END CHANGE 7 =====
     
     con.query(getUserDataQuery, [email], async (err, results) => {
         if (err) {
@@ -547,7 +628,12 @@ app.post('/webauthn/verify-token', (req, res) => {
 });
 
 app.post('/webauthn/refresh-token', (req, res) => {
-    const { refreshToken } = req.body;
+    // ===== CHANGE 8: the refresh token is an httpOnly cookie, so the frontend can't put it in the body =====
+    // old code
+    // const { refreshToken } = req.body;
+    // new code
+    const refreshToken = req.cookies.refreshToken || req.body.refreshToken;
+    // ===== END CHANGE 8 =====
 
     if (!refreshToken) {
         return res.status(400).json({ success: false, error: 'No refresh token provided' });
